@@ -8,10 +8,12 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"cloak-dpi/internal/blacklist"
 	"cloak-dpi/internal/logging"
 	"cloak-dpi/internal/proxy"
+	"cloak-dpi/internal/resolver"
 )
 
 const (
@@ -19,13 +21,20 @@ const (
 	defaultHost     = "0.0.0.0"
 	defaultPort     = 8888
 	defaultLogLevel = "silent"
+
+	defaultPrimaryDNSTimeout     = 2
+	defaultPrimaryDNSHealthcheck = 30
 )
 
 type config struct {
-	host          string
-	port          int
-	blacklistPath string
-	logLevel      logging.Level
+	host                  string
+	port                  int
+	blacklistPath         string
+	logLevel              logging.Level
+	primaryDNS            string
+	fallbackDNS           string
+	primaryDNSTimeout     int
+	primaryDNSHealthcheck int
 }
 
 func main() {
@@ -43,10 +52,28 @@ func main() {
 		}
 	}
 
+	var dns *resolver.Resolver
+	if cfg.primaryDNS != "" {
+		var err error
+		dns, err = resolver.New(resolver.Config{
+			Primary:             cfg.primaryDNS,
+			Fallback:            cfg.fallbackDNS,
+			PrimaryTimeout:      time.Duration(cfg.primaryDNSTimeout) * time.Second,
+			HealthcheckInterval: time.Duration(cfg.primaryDNSHealthcheck) * time.Second,
+			Logger:              log,
+		})
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(2)
+		}
+		defer dns.Close()
+	}
+
 	server := proxy.New(proxy.Options{
 		Host:          cfg.host,
 		Port:          cfg.port,
 		BlacklistPath: cfg.blacklistPath,
+		DNS:           dns,
 	}, blocked, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -66,6 +93,10 @@ func parseFlags() *config {
 	flag.StringVar(&cfg.host, "h", defaultHost, "proxy listen host")
 	flag.IntVar(&cfg.port, "p", defaultPort, "proxy listen port")
 	flag.StringVar(&cfg.blacklistPath, "blacklist", "", "path to an optional domain blacklist file")
+	flag.StringVar(&cfg.primaryDNS, "dns-primary", "", "primary DNS server in ip:port format, e.g. 1.1.1.1:53")
+	flag.StringVar(&cfg.fallbackDNS, "dns-fallback", "", "fallback DNS server in ip:port format, used when the primary DNS fails")
+	flag.IntVar(&cfg.primaryDNSTimeout, "dns-primary-timeout", defaultPrimaryDNSTimeout, "seconds before a primary DNS query counts as timed out and marked as down")
+	flag.IntVar(&cfg.primaryDNSHealthcheck, "dns-primary-healthcheck", defaultPrimaryDNSHealthcheck, "seconds between primary DNS health checks while it is down")
 	flag.StringVar(&logLevelName, "log-level", defaultLogLevel, "log level: debug, info, warn, error, fatal, or silent")
 
 	flag.Usage = func() {
@@ -98,6 +129,25 @@ func parseFlags() *config {
 	if cfg.port < 1 || cfg.port > 65535 {
 		_, _ = fmt.Fprintf(os.Stderr, "error: invalid port %d\n", cfg.port)
 		os.Exit(2)
+	}
+
+	cfg.primaryDNS = strings.TrimSpace(cfg.primaryDNS)
+	cfg.fallbackDNS = strings.TrimSpace(cfg.fallbackDNS)
+
+	if cfg.fallbackDNS != "" && cfg.primaryDNS == "" {
+		_, _ = fmt.Fprintln(os.Stderr, "error: --dns-fallback requires --dns-primary")
+		os.Exit(2)
+	}
+
+	if cfg.primaryDNS != "" {
+		if cfg.primaryDNSTimeout < 1 {
+			_, _ = fmt.Fprintln(os.Stderr, "error: --dns-primary-timeout must be at least 1 second")
+			os.Exit(2)
+		}
+		if cfg.primaryDNSHealthcheck < 1 {
+			_, _ = fmt.Fprintln(os.Stderr, "error: --dns-primary-healthcheck must be at least 1 second")
+			os.Exit(2)
+		}
 	}
 
 	return cfg

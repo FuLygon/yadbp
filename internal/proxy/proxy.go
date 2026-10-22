@@ -17,6 +17,7 @@ import (
 	"cloak-dpi/internal/blacklist"
 	"cloak-dpi/internal/fragment"
 	"cloak-dpi/internal/logging"
+	"cloak-dpi/internal/resolver"
 )
 
 const (
@@ -25,18 +26,21 @@ const (
 	headerReadTimeout  = 10 * time.Second
 	initialDataTimeout = 10 * time.Second
 	dialTimeout        = 10 * time.Second
+	dialStaggerDelay   = 250 * time.Millisecond
 )
 
 type Options struct {
 	Host          string
 	Port          int
 	BlacklistPath string
+	DNS           *resolver.Resolver
 }
 
 type Server struct {
 	opts      Options
 	blacklist *blacklist.List
 	log       *logging.Logger
+	dns       *resolver.Resolver
 }
 
 func New(opts Options, blocked *blacklist.List, log *logging.Logger) *Server {
@@ -44,6 +48,7 @@ func New(opts Options, blocked *blacklist.List, log *logging.Logger) *Server {
 		opts:      opts,
 		blacklist: blocked,
 		log:       log,
+		dns:       opts.DNS,
 	}
 }
 
@@ -84,10 +89,13 @@ func (s *Server) printStartup(addr string) {
 	s.log.Printf("Listening on %s", addr)
 
 	if s.blacklist == nil {
-		s.log.Printf("Blacklist: disabled")
+		s.log.Printf("Blacklist: none")
 	} else {
 		s.log.Printf("Blacklist: %s (%d domains)", s.opts.BlacklistPath, s.blacklist.Len())
 	}
+
+	s.log.Printf("DNS Primary: %s", s.dns.Primary())
+	s.log.Printf("DNS Fallback: %s", s.dns.Fallback())
 
 	s.log.Printf("Press Ctrl+C to stop.")
 }
@@ -112,7 +120,7 @@ func (s *Server) handleClient(client net.Conn) {
 		return
 	}
 
-	s.log.Infof("%s %s", method, host)
+	s.log.Debugf("%s %s", method, host)
 
 	if method == "connect" {
 		s.handleConnect(client, reader, host, port)
@@ -123,7 +131,7 @@ func (s *Server) handleClient(client net.Conn) {
 }
 
 func (s *Server) handleConnect(client net.Conn, clientReader *bufio.Reader, host, port string) {
-	remote, err := dialRemote(host, port)
+	remote, err := s.dialRemote(host, port)
 	if err != nil {
 		s.log.Errorf("%s: %v", net.JoinHostPort(host, port), err)
 		writeHTTPStatus(client, http.StatusBadGateway)
@@ -179,7 +187,7 @@ func (s *Server) handleConnect(client net.Conn, clientReader *bufio.Reader, host
 				return
 			}
 
-			s.log.Infof("fragmented ClientHello for %s into %d records", host, len(parts))
+			s.log.Infof("fragmented %s into %d records", host, len(parts))
 			s.pipe(client, clientReader, remote, host)
 			return
 		}
@@ -199,7 +207,7 @@ func (s *Server) handleConnect(client net.Conn, clientReader *bufio.Reader, host
 }
 
 func (s *Server) handleHTTP(client net.Conn, clientReader *bufio.Reader, header []byte, host, port string) {
-	remote, err := dialRemote(host, port)
+	remote, err := s.dialRemote(host, port)
 	if err != nil {
 		s.log.Errorf("connect %s: %v", net.JoinHostPort(host, port), err)
 		writeHTTPStatus(client, http.StatusBadGateway)
@@ -215,9 +223,90 @@ func (s *Server) handleHTTP(client net.Conn, clientReader *bufio.Reader, header 
 	s.pipe(client, clientReader, remote, host)
 }
 
-func dialRemote(host, port string) (net.Conn, error) {
-	dialer := net.Dialer{Timeout: dialTimeout}
-	return dialer.Dial("tcp", net.JoinHostPort(host, port))
+func (s *Server) dialRemote(host, port string) (net.Conn, error) {
+	if s.dns == nil {
+		dialer := net.Dialer{Timeout: dialTimeout}
+		return dialer.Dial("tcp", net.JoinHostPort(host, port))
+	}
+
+	addrs, err := s.dns.LookupIP(context.Background(), host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: %w", host, err)
+	}
+
+	return dialAddresses(addrs, port)
+}
+
+func dialAddresses(addrs []net.IPAddr, port string) (net.Conn, error) {
+	if len(addrs) == 0 {
+		return nil, errors.New("no addresses to dial")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+
+	results := make(chan dialResult, len(addrs))
+	pending := 0
+	next := 0
+	var lastErr error
+
+	start := func(addr net.IPAddr) {
+		pending++
+		go func() {
+			dialer := net.Dialer{Timeout: dialTimeout}
+			conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(addr.IP.String(), port))
+			results <- dialResult{conn: conn, err: err}
+		}()
+	}
+
+	start(addrs[next])
+	next++
+
+	delay := time.NewTimer(dialStaggerDelay)
+	defer delay.Stop()
+	delayC := delay.C
+
+	for pending > 0 {
+		select {
+		case result := <-results:
+			pending--
+			if result.err == nil {
+				cancel()
+				go func(remaining int) {
+					for i := 0; i < remaining; i++ {
+						if leftover := <-results; leftover.conn != nil {
+							_ = leftover.conn.Close()
+						}
+					}
+				}(pending)
+				return result.conn, nil
+			}
+
+			lastErr = result.err
+			if next < len(addrs) {
+				start(addrs[next])
+				next++
+			}
+		case <-delayC:
+			if next < len(addrs) {
+				start(addrs[next])
+				next++
+				delay.Reset(dialStaggerDelay)
+			} else {
+				delayC = nil
+			}
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("all connection attempts failed")
+	}
+	return nil, lastErr
 }
 
 func readHTTPHeader(reader *bufio.Reader) ([]byte, error) {

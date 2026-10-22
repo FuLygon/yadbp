@@ -72,7 +72,6 @@ func (l *Logger) Errorf(format string, args ...any) {
 	l.logf(Error, format, args...)
 }
 
-// Fatalf logs at fatal level and exits with status 1.
 func (l *Logger) Fatalf(format string, args ...any) {
 	l.logf(Fatal, format, args...)
 	os.Exit(1)
