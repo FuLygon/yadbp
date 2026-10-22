@@ -1,0 +1,9 @@
+# Build output
+/bin/
+/*.exe
+
+# IDE
+/.idea/
+
+# Separate NoDPI reference checkout
+/NoDPI/
