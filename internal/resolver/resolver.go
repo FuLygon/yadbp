@@ -186,12 +186,8 @@ func (r *Resolver) resolve(ctx context.Context, host string) (addrs []net.IPAddr
 		if lookupErr != nil {
 			return nil, lookupErr
 		}
-		valid := usable(result)
-		if len(valid) == 0 {
-			return nil, fmt.Errorf("%s returned no usable addresses for %s", r.primary.addr, host)
-		}
 		source = "primary " + r.primary.addr
-		return valid, nil
+		return result, nil
 	}
 
 	var primaryErr error
@@ -202,11 +198,8 @@ func (r *Resolver) resolve(ctx context.Context, host string) (addrs []net.IPAddr
 		result, lookupErr := r.primary.lookup(ctx, host, r.timeout)
 		switch {
 		case lookupErr == nil:
-			if valid := usable(result); len(valid) > 0 {
-				source = "primary " + r.primary.addr
-				return valid, nil
-			}
-			r.log.Warnf("primary %s returned an unusable answer for %s; using fallback", r.primary.addr, host)
+			source = "primary " + r.primary.addr
+			return result, nil
 		case isNotFound(lookupErr):
 			return nil, lookupErr
 		default:
@@ -219,25 +212,18 @@ func (r *Resolver) resolve(ctx context.Context, host string) (addrs []net.IPAddr
 
 	fallbackAddrs, fallbackErr := r.fallback.lookup(ctx, host, fallbackTimeout)
 	if fallbackErr == nil {
-		if valid := usable(fallbackAddrs); len(valid) > 0 {
-			source = "fallback " + r.fallback.addr
-			return valid, nil
-		}
-		fallbackErr = fmt.Errorf("%s returned no usable addresses for %s", r.fallback.addr, host)
-		r.log.Warnf("fallback %s returned an unusable answer for %s", r.fallback.addr, host)
+		source = "fallback " + r.fallback.addr
+		return fallbackAddrs, nil
 	}
 
 	if !primaryTried {
 		result, lookupErr := r.primary.lookup(ctx, host, r.timeout)
 		if lookupErr == nil {
-			if valid := usable(result); len(valid) > 0 {
-				r.markPrimaryUp()
-				source = "primary " + r.primary.addr + " (last resort)"
-				return valid, nil
-			}
-		} else {
-			primaryErr = lookupErr
+			r.markPrimaryUp()
+			source = "primary " + r.primary.addr + " (last resort)"
+			return result, nil
 		}
+		primaryErr = lookupErr
 	}
 
 	return nil, fmt.Errorf(
@@ -315,13 +301,8 @@ func (r *Resolver) checkPrimary() {
 		r.mu.Unlock()
 	}()
 
-	addrs, err := r.primary.lookup(context.Background(), healthcheckHost, r.timeout)
-	if err != nil {
+	if _, err := r.primary.lookup(context.Background(), healthcheckHost, r.timeout); err != nil {
 		r.log.Debugf("primary %s still unreachable: %v", r.primary.addr, err)
-		return
-	}
-	if len(usable(addrs)) == 0 {
-		r.log.Debugf("primary %s still returning unusable answers", r.primary.addr)
 		return
 	}
 
@@ -398,17 +379,6 @@ func normalizeAddress(value string) (string, error) {
 	}
 
 	return net.JoinHostPort(ip.String(), port), nil
-}
-
-func usable(addrs []net.IPAddr) []net.IPAddr {
-	out := make([]net.IPAddr, 0, len(addrs))
-	for _, addr := range addrs {
-		if addr.IP == nil || addr.IP.IsLoopback() || addr.IP.IsUnspecified() {
-			continue
-		}
-		out = append(out, addr)
-	}
-	return out
 }
 
 func cloneAddrs(addrs []net.IPAddr) []net.IPAddr {
