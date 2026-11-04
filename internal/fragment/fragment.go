@@ -39,6 +39,18 @@ func sniFragments(data []byte, start, end int) [][]byte {
 	return parts
 }
 
+// SNISplitOffset returns the offset inside a ClientHello payload at which it can
+// be split across TCP segments so the SNI hostname is not contained in a single
+// packet. The TLS record itself is left intact, which keeps SNI-based frontends
+// such as DDoS-Guard working.
+func SNISplitOffset(data []byte) (int, bool) {
+	start, end, ok := extractSNIPosition(data)
+	if !ok {
+		return 0, false
+	}
+	return start + (end-start)/2, true
+}
+
 func extractSNIPosition(data []byte) (start, end int, ok bool) {
 	for i := 0; i+9 <= len(data); i++ {
 		if data[i] != 0 || data[i+1] != 0 {

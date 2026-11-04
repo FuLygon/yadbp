@@ -27,6 +27,7 @@ const (
 	initialDataTimeout = 10 * time.Second
 	dialTimeout        = 10 * time.Second
 	dialStaggerDelay   = 250 * time.Millisecond
+	tcpSplitDelay      = 10 * time.Millisecond
 )
 
 type Options struct {
@@ -41,6 +42,9 @@ type Server struct {
 	blacklist *blacklist.List
 	log       *logging.Logger
 	dns       *resolver.Resolver
+
+	modeMu sync.Mutex
+	modes  map[string]*fragmentModeEntry
 }
 
 func New(opts Options, blocked *blacklist.List, log *logging.Logger) *Server {
@@ -49,6 +53,7 @@ func New(opts Options, blocked *blacklist.List, log *logging.Logger) *Server {
 		blacklist: blocked,
 		log:       log,
 		dns:       opts.DNS,
+		modes:     make(map[string]*fragmentModeEntry),
 	}
 }
 
@@ -177,19 +182,46 @@ func (s *Server) handleConnect(client net.Conn, clientReader *bufio.Reader, host
 	}
 
 	if shouldFragment {
-		if parts, ok := fragment.ClientHello(body); ok {
-			var fragmented bytes.Buffer
-			for _, part := range parts {
-				fragmented.Write(part)
+		split, hasSNI := fragment.SNISplitOffset(body)
+
+		if hasSNI && s.needsTCPSegments(host, port) {
+			initial := make([]byte, 0, len(head)+len(body))
+			initial = append(initial, head...)
+			initial = append(initial, body...)
+			offset := len(head) + split
+
+			_, err = remote.Write(initial[:offset])
+			if err == nil {
+				// Give the first segment time to leave the host so the
+				// hostname is not coalesced back into one packet.
+				time.Sleep(tcpSplitDelay)
+				_, err = remote.Write(initial[offset:])
 			}
-			if _, err = remote.Write(fragmented.Bytes()); err != nil {
+			if err != nil {
 				s.log.Errorf("write fragmented ClientHello to %s: %v", host, err)
 				return
 			}
 
-			s.log.Infof("fragmented %s into %d records", host, len(parts))
+			s.log.Infof("fragmented %s into 2 tcp segments", host)
 			s.pipe(client, clientReader, remote, host)
 			return
+		}
+
+		if hasSNI {
+			if parts, ok := fragment.ClientHello(body); ok {
+				var fragmented bytes.Buffer
+				for _, part := range parts {
+					fragmented.Write(part)
+				}
+				if _, err = remote.Write(fragmented.Bytes()); err != nil {
+					s.log.Errorf("write fragmented ClientHello to %s: %v", host, err)
+					return
+				}
+
+				s.log.Infof("fragmented %s into %d records", host, len(parts))
+				s.pipe(client, clientReader, remote, host)
+				return
+			}
 		}
 
 		s.log.Infof("could not locate SNI in ClientHello for %s; forwarding unmodified", host)
@@ -224,25 +256,29 @@ func (s *Server) handleHTTP(client net.Conn, clientReader *bufio.Reader, header 
 }
 
 func (s *Server) dialRemote(host, port string) (net.Conn, error) {
+	return s.dialRemoteContext(context.Background(), host, port)
+}
+
+func (s *Server) dialRemoteContext(ctx context.Context, host, port string) (net.Conn, error) {
 	if s.dns == nil {
 		dialer := net.Dialer{Timeout: dialTimeout}
-		return dialer.Dial("tcp", net.JoinHostPort(host, port))
+		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	}
 
-	addrs, err := s.dns.LookupIP(context.Background(), host)
+	addrs, err := s.dns.LookupIP(ctx, host)
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", host, err)
 	}
 
-	return dialAddresses(addrs, port)
+	return dialAddresses(ctx, addrs, port)
 }
 
-func dialAddresses(addrs []net.IPAddr, port string) (net.Conn, error) {
+func dialAddresses(ctx context.Context, addrs []net.IPAddr, port string) (net.Conn, error) {
 	if len(addrs) == 0 {
 		return nil, errors.New("no addresses to dial")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	dialCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	type dialResult struct {
@@ -259,7 +295,7 @@ func dialAddresses(addrs []net.IPAddr, port string) (net.Conn, error) {
 		pending++
 		go func() {
 			dialer := net.Dialer{Timeout: dialTimeout}
-			conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(addr.IP.String(), port))
+			conn, err := dialer.DialContext(dialCtx, "tcp", net.JoinHostPort(addr.IP.String(), port))
 			results <- dialResult{conn: conn, err: err}
 		}()
 	}
