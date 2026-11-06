@@ -26,6 +26,7 @@ const (
 	headerReadTimeout  = 10 * time.Second
 	initialDataTimeout = 10 * time.Second
 	dialTimeout        = 10 * time.Second
+	ctxTimeout         = 20 * time.Second
 	dialStaggerDelay   = 250 * time.Millisecond
 )
 
@@ -81,7 +82,7 @@ func (s *Server) Serve(ctx context.Context) error {
 			return fmt.Errorf("accept connection: %w", err)
 		}
 
-		go s.handleClient(client)
+		go s.handleClient(ctx, client)
 	}
 }
 
@@ -100,7 +101,7 @@ func (s *Server) printStartup(addr string) {
 	s.log.Printf("Press Ctrl+C to stop.")
 }
 
-func (s *Server) handleClient(client net.Conn) {
+func (s *Server) handleClient(ctx context.Context, client net.Conn) {
 	defer client.Close()
 
 	_ = client.SetReadDeadline(time.Now().Add(headerReadTimeout))
@@ -123,15 +124,15 @@ func (s *Server) handleClient(client net.Conn) {
 	s.log.Debugf("%s %s", method, host)
 
 	if method == "connect" {
-		s.handleConnect(client, reader, host, port)
+		s.handleConnect(ctx, client, reader, host, port)
 		return
 	}
 
-	s.handleHTTP(client, reader, header, host, port)
+	s.handleHTTP(ctx, client, reader, header, host, port)
 }
 
-func (s *Server) handleConnect(client net.Conn, clientReader *bufio.Reader, host, port string) {
-	remote, err := s.dialRemote(context.Background(), host, port)
+func (s *Server) handleConnect(ctx context.Context, client net.Conn, clientReader *bufio.Reader, host, port string) {
+	remote, err := s.dialRemote(ctx, host, port)
 	if err != nil {
 		s.log.Errorf("%s: %v", net.JoinHostPort(host, port), err)
 		writeHTTPStatus(client, http.StatusBadGateway)
@@ -206,8 +207,8 @@ func (s *Server) handleConnect(client net.Conn, clientReader *bufio.Reader, host
 	s.pipe(client, clientReader, remote, host)
 }
 
-func (s *Server) handleHTTP(client net.Conn, clientReader *bufio.Reader, header []byte, host, port string) {
-	remote, err := s.dialRemote(context.Background(), host, port)
+func (s *Server) handleHTTP(ctx context.Context, client net.Conn, clientReader *bufio.Reader, header []byte, host, port string) {
+	remote, err := s.dialRemote(ctx, host, port)
 	if err != nil {
 		s.log.Errorf("connect %s: %v", net.JoinHostPort(host, port), err)
 		writeHTTPStatus(client, http.StatusBadGateway)
@@ -224,6 +225,9 @@ func (s *Server) handleHTTP(client net.Conn, clientReader *bufio.Reader, header 
 }
 
 func (s *Server) dialRemote(ctx context.Context, host, port string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, ctxTimeout)
+	defer cancel()
+
 	if s.dns == nil {
 		dialer := net.Dialer{Timeout: dialTimeout}
 		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
