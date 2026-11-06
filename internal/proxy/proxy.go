@@ -14,10 +14,10 @@ import (
 	"sync"
 	"time"
 
-	"cloak-dpi/internal/blacklist"
-	"cloak-dpi/internal/fragment"
-	"cloak-dpi/internal/logging"
-	"cloak-dpi/internal/resolver"
+	"yadbp/internal/blacklist"
+	"yadbp/internal/fragment"
+	"yadbp/internal/logging"
+	"yadbp/internal/resolver"
 )
 
 const (
@@ -27,7 +27,6 @@ const (
 	initialDataTimeout = 10 * time.Second
 	dialTimeout        = 10 * time.Second
 	dialStaggerDelay   = 250 * time.Millisecond
-	tcpSplitDelay      = 10 * time.Millisecond
 )
 
 type Options struct {
@@ -42,9 +41,6 @@ type Server struct {
 	blacklist *blacklist.List
 	log       *logging.Logger
 	dns       *resolver.Resolver
-
-	modeMu sync.Mutex
-	modes  map[string]*fragmentModeEntry
 }
 
 func New(opts Options, blocked *blacklist.List, log *logging.Logger) *Server {
@@ -53,7 +49,6 @@ func New(opts Options, blocked *blacklist.List, log *logging.Logger) *Server {
 		blacklist: blocked,
 		log:       log,
 		dns:       opts.DNS,
-		modes:     make(map[string]*fragmentModeEntry),
 	}
 }
 
@@ -136,7 +131,7 @@ func (s *Server) handleClient(client net.Conn) {
 }
 
 func (s *Server) handleConnect(client net.Conn, clientReader *bufio.Reader, host, port string) {
-	remote, err := s.dialRemote(host, port)
+	remote, err := s.dialRemote(context.Background(), host, port)
 	if err != nil {
 		s.log.Errorf("%s: %v", net.JoinHostPort(host, port), err)
 		writeHTTPStatus(client, http.StatusBadGateway)
@@ -181,56 +176,29 @@ func (s *Server) handleConnect(client net.Conn, clientReader *bufio.Reader, host
 		s.log.Debugf("skipping fragmentation for %s: not in blacklist", host)
 	}
 
-	if shouldFragment {
-		split, hasSNI := fragment.SNISplitOffset(body)
+	record := make([]byte, 0, len(head)+len(body))
+	record = append(record, head...)
+	record = append(record, body...)
 
-		if hasSNI && s.needsTCPSegments(host, port) {
-			initial := make([]byte, 0, len(head)+len(body))
-			initial = append(initial, head...)
-			initial = append(initial, body...)
-			offset := len(head) + split
-
-			_, err = remote.Write(initial[:offset])
-			if err == nil {
-				// Give the first segment time to leave the host so the
-				// hostname is not coalesced back into one packet.
-				time.Sleep(tcpSplitDelay)
-				_, err = remote.Write(initial[offset:])
-			}
-			if err != nil {
+	if shouldFragment && fragment.IsClientHello(record) {
+		chunks := fragment.TCPChunks(record)
+		for _, chunk := range chunks {
+			if _, err = remote.Write(chunk); err != nil {
 				s.log.Errorf("write fragmented ClientHello to %s: %v", host, err)
 				return
 			}
-
-			s.log.Infof("fragmented %s into 2 tcp segments", host)
-			s.pipe(client, clientReader, remote, host)
-			return
 		}
 
-		if hasSNI {
-			if parts, ok := fragment.ClientHello(body); ok {
-				var fragmented bytes.Buffer
-				for _, part := range parts {
-					fragmented.Write(part)
-				}
-				if _, err = remote.Write(fragmented.Bytes()); err != nil {
-					s.log.Errorf("write fragmented ClientHello to %s: %v", host, err)
-					return
-				}
-
-				s.log.Infof("fragmented %s into %d records", host, len(parts))
-				s.pipe(client, clientReader, remote, host)
-				return
-			}
-		}
-
-		s.log.Infof("could not locate SNI in ClientHello for %s; forwarding unmodified", host)
+		s.log.Infof("fragmented %s into %d tcp segments", host, len(chunks))
+		s.pipe(client, clientReader, remote, host)
+		return
 	}
 
-	initial := make([]byte, 0, len(head)+len(body))
-	initial = append(initial, head...)
-	initial = append(initial, body...)
-	if _, err = remote.Write(initial); err != nil {
+	if shouldFragment {
+		s.log.Debugf("not a TLS ClientHello for %s; forwarding unmodified", host)
+	}
+
+	if _, err = remote.Write(record); err != nil {
 		s.log.Errorf("write TLS ClientHello to %s: %v", host, err)
 		return
 	}
@@ -239,7 +207,7 @@ func (s *Server) handleConnect(client net.Conn, clientReader *bufio.Reader, host
 }
 
 func (s *Server) handleHTTP(client net.Conn, clientReader *bufio.Reader, header []byte, host, port string) {
-	remote, err := s.dialRemote(host, port)
+	remote, err := s.dialRemote(context.Background(), host, port)
 	if err != nil {
 		s.log.Errorf("connect %s: %v", net.JoinHostPort(host, port), err)
 		writeHTTPStatus(client, http.StatusBadGateway)
@@ -255,11 +223,7 @@ func (s *Server) handleHTTP(client net.Conn, clientReader *bufio.Reader, header 
 	s.pipe(client, clientReader, remote, host)
 }
 
-func (s *Server) dialRemote(host, port string) (net.Conn, error) {
-	return s.dialRemoteContext(context.Background(), host, port)
-}
-
-func (s *Server) dialRemoteContext(ctx context.Context, host, port string) (net.Conn, error) {
+func (s *Server) dialRemote(ctx context.Context, host, port string) (net.Conn, error) {
 	if s.dns == nil {
 		dialer := net.Dialer{Timeout: dialTimeout}
 		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
@@ -295,7 +259,8 @@ func dialAddresses(ctx context.Context, addrs []net.IPAddr, port string) (net.Co
 		pending++
 		go func() {
 			dialer := net.Dialer{Timeout: dialTimeout}
-			conn, err := dialer.DialContext(dialCtx, "tcp", net.JoinHostPort(addr.IP.String(), port))
+			// addr.String keeps the zone for link-local IPv6 addresses.
+			conn, err := dialer.DialContext(dialCtx, "tcp", net.JoinHostPort(addr.String(), port))
 			results <- dialResult{conn: conn, err: err}
 		}()
 	}

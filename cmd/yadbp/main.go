@@ -10,14 +10,14 @@ import (
 	"syscall"
 	"time"
 
-	"cloak-dpi/internal/blacklist"
-	"cloak-dpi/internal/logging"
-	"cloak-dpi/internal/proxy"
-	"cloak-dpi/internal/resolver"
+	"yadbp/internal/blacklist"
+	"yadbp/internal/logging"
+	"yadbp/internal/proxy"
+	"yadbp/internal/resolver"
 )
 
 const (
-	appName         = "cloak-dpi"
+	appName         = "yadbp"
 	defaultHost     = "0.0.0.0"
 	defaultPort     = 8888
 	defaultLogLevel = "silent"

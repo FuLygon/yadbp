@@ -10,12 +10,13 @@ import (
 	"sync"
 	"time"
 
-	"cloak-dpi/internal/logging"
+	"yadbp/internal/logging"
 )
 
 const (
 	fallbackTimeout = 5 * time.Second
 	cacheTTL        = 60 * time.Second
+	cacheMaxEntries = 1000
 	healthcheckHost = "example.com"
 )
 
@@ -39,6 +40,7 @@ type Resolver struct {
 	probing   bool
 	cache     map[string]cacheEntry
 	inflight  map[string]*call
+	lastSweep time.Time
 
 	stop      chan struct{}
 	done      chan struct{}
@@ -51,8 +53,9 @@ type endpoint struct {
 }
 
 type cacheEntry struct {
-	addrs   []net.IPAddr
-	expires time.Time
+	addrs    []net.IPAddr
+	expires  time.Time
+	lastUsed time.Time
 }
 
 type call struct {
@@ -313,22 +316,68 @@ func (r *Resolver) cached(host string) ([]net.IPAddr, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	now := time.Now()
 	entry, ok := r.cache[host]
 	if !ok {
 		return nil, false
 	}
-	if time.Now().After(entry.expires) {
+	if now.After(entry.expires) {
 		delete(r.cache, host)
 		return nil, false
 	}
+	entry.lastUsed = now
+	r.cache[host] = entry
 
 	return cloneAddrs(entry.addrs), true
 }
 
 func (r *Resolver) store(host string, addrs []net.IPAddr) {
+	now := time.Now()
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.cache[host] = cacheEntry{addrs: cloneAddrs(addrs), expires: time.Now().Add(cacheTTL)}
+
+	// Expired entries are otherwise only removed when the same host is looked
+	// up again, so sweep them periodically to keep the cache bounded.
+	if now.Sub(r.lastSweep) >= cacheTTL {
+		r.sweepExpiredLocked(now)
+		r.lastSweep = now
+	}
+
+	// Also enforce a hard cap so a burst of unique hostnames cannot grow the
+	// cache without limit between sweeps. Evict the least recently used entry
+	// when the cap is reached.
+	if _, exists := r.cache[host]; !exists && len(r.cache) >= cacheMaxEntries {
+		r.sweepExpiredLocked(now)
+		for len(r.cache) >= cacheMaxEntries {
+			oldestName := ""
+			var oldestUsed time.Time
+			for name, entry := range r.cache {
+				if oldestName == "" || entry.lastUsed.Before(oldestUsed) {
+					oldestName = name
+					oldestUsed = entry.lastUsed
+				}
+			}
+			if oldestName == "" {
+				break
+			}
+			delete(r.cache, oldestName)
+		}
+	}
+
+	r.cache[host] = cacheEntry{
+		addrs:    cloneAddrs(addrs),
+		expires:  now.Add(cacheTTL),
+		lastUsed: now,
+	}
+}
+
+func (r *Resolver) sweepExpiredLocked(now time.Time) {
+	for name, entry := range r.cache {
+		if now.After(entry.expires) {
+			delete(r.cache, name)
+		}
+	}
 }
 
 func newEndpoint(addr string) *endpoint {
@@ -343,16 +392,40 @@ func newEndpoint(addr string) *endpoint {
 	return e
 }
 
+// lookup resolves host using IPv4 first. AAAA is queried only when the host
+// has no A record, so a blackholed IPv6 route cannot delay or break an
+// IPv4-capable host. Returned addresses stay in the resolver's order.
 func (e *endpoint) lookup(ctx context.Context, host string, timeout time.Duration) ([]net.IPAddr, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	addrs, err := e.resolver.LookupIPAddr(ctx, host)
+	addrs, err := e.lookupFamily(ctx, host, "ip4")
+	if err == nil && len(addrs) > 0 {
+		return addrs, nil
+	}
+	if err != nil && !isNotFound(err) {
+		return nil, err
+	}
+
+	addrs, err = e.lookupFamily(ctx, host, "ip6")
 	if err != nil {
 		return nil, err
 	}
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("%s returned no addresses for %s", e.addr, host)
+	}
+	return addrs, nil
+}
+
+func (e *endpoint) lookupFamily(ctx context.Context, host, network string) ([]net.IPAddr, error) {
+	ips, err := e.resolver.LookupIP(ctx, network, host)
+	if err != nil {
+		return nil, err
+	}
+
+	addrs := make([]net.IPAddr, 0, len(ips))
+	for _, ip := range ips {
+		addrs = append(addrs, net.IPAddr{IP: ip})
 	}
 	return addrs, nil
 }
