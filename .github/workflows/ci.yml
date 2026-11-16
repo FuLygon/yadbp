@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Match the release targets with native runners so the test binary is
+        # executed on the same OS and architecture that ships to users.
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-latest
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+          - goos: darwin
+            goarch: amd64
+            runner: macos-15-intel
+          - goos: darwin
+            goarch: arm64
+            runner: macos-latest
+          - goos: windows
+            goarch: amd64
+            runner: windows-latest
+          - goos: windows
+            goarch: arm64
+            runner: windows-11-arm
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify runner target
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          actual="$(go env GOOS)/$(go env GOARCH)"
+          expected="${{ matrix.goos }}/${{ matrix.goarch }}"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "runner is $actual, expected $expected" >&2
+            exit 1
+          fi
+
+      - name: Run tests
+        shell: bash
+        run: go test -count=1 -shuffle=on ./...
+
+      - name: Run race tests
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        shell: bash
+        run: go test -race -count=1 -shuffle=on ./...
+
+      - name: Run go vet
+        shell: bash
+        run: go vet ./...

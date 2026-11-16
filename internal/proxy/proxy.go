@@ -18,6 +18,7 @@ import (
 	"yadbp/internal/fragment"
 	"yadbp/internal/logging"
 	"yadbp/internal/resolver"
+	"yadbp/internal/utils"
 )
 
 const (
@@ -225,6 +226,7 @@ func (s *Server) Serve(ctx context.Context) error {
 
 // printStartup writes the human-readable startup summary.
 func (s *Server) printStartup(addr string) {
+	s.log.Printf("%s", utils.Header())
 	s.log.Printf("Listening on %s", addr)
 
 	if s.blacklist == nil {

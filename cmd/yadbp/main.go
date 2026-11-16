@@ -14,12 +14,12 @@ import (
 	"yadbp/internal/logging"
 	"yadbp/internal/proxy"
 	"yadbp/internal/resolver"
+	"yadbp/internal/utils"
 )
 
 // Defaults used when the corresponding command-line flags are omitted.
 const (
-	appName         = "yadbp"
-	defaultHost     = "0.0.0.0"
+	defaultHost     = "127.0.0.1"
 	defaultPort     = 8888
 	defaultLogLevel = "silent"
 
@@ -107,7 +107,8 @@ func parseFlags() *config {
 
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
-		_, _ = fmt.Fprintf(out, "Usage: %s [options]\n\nOptions:\n", appName)
+		_, _ = fmt.Fprintln(out, utils.Header())
+		_, _ = fmt.Fprintf(out, "Usage: %s [options]\n\nOptions:\n", utils.Name)
 		flag.PrintDefaults()
 	}
 
