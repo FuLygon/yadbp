@@ -14,20 +14,32 @@ import (
 )
 
 const (
+	// fallbackTimeout bounds a query to the fallback DNS server.
 	fallbackTimeout = 5 * time.Second
-	cacheTTL        = 60 * time.Second
+	// cacheTTL is how long resolved address sets are cached.
+	cacheTTL = 60 * time.Second
+	// cacheMaxEntries caps the number of cached hostnames.
 	cacheMaxEntries = 1000
+	// healthcheckHost is the name probed while the primary is marked down.
 	healthcheckHost = "example.com"
 )
 
+// Config configures a Resolver.
 type Config struct {
-	Primary             string
-	Fallback            string
-	PrimaryTimeout      time.Duration
+	// Primary is the primary DNS server in ip:port form.
+	Primary string
+	// Fallback is an optional fallback DNS server in ip:port form.
+	Fallback string
+	// PrimaryTimeout bounds each primary DNS query.
+	PrimaryTimeout time.Duration
+	// HealthcheckInterval controls how often a down primary is probed.
 	HealthcheckInterval time.Duration
-	Logger              *logging.Logger
+	// Logger receives debug and status messages.
+	Logger *logging.Logger
 }
 
+// Resolver resolves hostnames using a primary DNS server, an optional fallback,
+// request collapsing, and a bounded cache. It is safe for concurrent use.
 type Resolver struct {
 	primary  *endpoint
 	fallback *endpoint
@@ -47,23 +59,29 @@ type Resolver struct {
 	closeOnce sync.Once
 }
 
+// endpoint is a DNS server address and the net.Resolver configured to reach it.
 type endpoint struct {
 	addr     string
 	resolver *net.Resolver
 }
 
+// cacheEntry holds a cached address set and its LRU bookkeeping.
 type cacheEntry struct {
 	addrs    []net.IPAddr
 	expires  time.Time
 	lastUsed time.Time
 }
 
+// call collapses concurrent lookups for the same hostname.
 type call struct {
 	wg    sync.WaitGroup
 	addrs []net.IPAddr
 	err   error
 }
 
+// New validates cfg and returns a resolver. When Fallback is set, New also
+// starts the background health loop that promotes the primary again after it
+// recovers; call Close to stop it.
 func New(cfg Config) (*Resolver, error) {
 	if cfg.PrimaryTimeout <= 0 {
 		return nil, errors.New("primary dns timeout must be greater than zero")
@@ -107,6 +125,7 @@ func New(cfg Config) (*Resolver, error) {
 	return r, nil
 }
 
+// Primary returns the primary server address, or "system" for a nil resolver.
 func (r *Resolver) Primary() string {
 	if r == nil {
 		return "system"
@@ -114,6 +133,8 @@ func (r *Resolver) Primary() string {
 	return r.primary.addr
 }
 
+// Fallback returns the fallback server address, or "none" when no fallback is
+// configured.
 func (r *Resolver) Fallback() string {
 	if r == nil || r.fallback == nil {
 		return "none"
@@ -121,6 +142,8 @@ func (r *Resolver) Fallback() string {
 	return r.fallback.addr
 }
 
+// Close stops the health loop. It is safe to call more than once and is a no-op
+// for a nil resolver or a resolver without a fallback.
 func (r *Resolver) Close() {
 	if r == nil || r.stop == nil {
 		return
@@ -131,6 +154,9 @@ func (r *Resolver) Close() {
 	})
 }
 
+// LookupIP resolves host to a list of addresses. Literal IPs are returned
+// directly. Results are cached for cacheTTL, and concurrent lookups for the
+// same host share one DNS request. The resolver's address order is preserved.
 func (r *Resolver) LookupIP(ctx context.Context, host string) ([]net.IPAddr, error) {
 	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
 	if host == "" {
@@ -171,6 +197,11 @@ func (r *Resolver) LookupIP(ctx context.Context, host string) ([]net.IPAddr, err
 	return c.addrs, c.err
 }
 
+// resolve applies primary/fallback policy. A name-not-found answer from the
+// primary is authoritative and is not retried against the fallback; other
+// primary failures mark it down and use the fallback. If the primary was
+// already marked down and the fallback also fails, the primary is tried once as
+// a last resort.
 func (r *Resolver) resolve(ctx context.Context, host string) (addrs []net.IPAddr, err error) {
 	start := time.Now()
 	source := ""
@@ -235,12 +266,14 @@ func (r *Resolver) resolve(ctx context.Context, host string) (addrs []net.IPAddr
 	)
 }
 
+// isPrimaryUp reports whether the primary is currently considered reachable.
 func (r *Resolver) isPrimaryUp() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.primaryUp
 }
 
+// markPrimaryDown records a primary failure and logs the transition once.
 func (r *Resolver) markPrimaryDown(err error) {
 	r.mu.Lock()
 	wasUp := r.primaryUp
@@ -262,6 +295,7 @@ func (r *Resolver) markPrimaryDown(err error) {
 	r.log.Warnf("primary %s unreachable (%v)", r.primary.addr, err)
 }
 
+// markPrimaryUp records a primary recovery and logs the transition once.
 func (r *Resolver) markPrimaryUp() {
 	r.mu.Lock()
 	wasUp := r.primaryUp
@@ -273,6 +307,7 @@ func (r *Resolver) markPrimaryUp() {
 	}
 }
 
+// healthLoop periodically checks whether a down primary has recovered.
 func (r *Resolver) healthLoop() {
 	defer close(r.done)
 
@@ -289,6 +324,8 @@ func (r *Resolver) healthLoop() {
 	}
 }
 
+// checkPrimary probes the primary once when it is down and no probe is already
+// running. A successful probe marks the primary up again.
 func (r *Resolver) checkPrimary() {
 	r.mu.Lock()
 	if r.primaryUp || r.probing {
@@ -312,6 +349,8 @@ func (r *Resolver) checkPrimary() {
 	r.markPrimaryUp()
 }
 
+// cached returns a copy of the cached addresses for host and refreshes its LRU
+// timestamp. Expired entries are removed.
 func (r *Resolver) cached(host string) ([]net.IPAddr, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -331,6 +370,8 @@ func (r *Resolver) cached(host string) ([]net.IPAddr, bool) {
 	return cloneAddrs(entry.addrs), true
 }
 
+// store inserts or replaces a cache entry. It periodically sweeps expired
+// entries and enforces the hard cap by evicting the least recently used host.
 func (r *Resolver) store(host string, addrs []net.IPAddr) {
 	now := time.Now()
 
@@ -372,6 +413,7 @@ func (r *Resolver) store(host string, addrs []net.IPAddr) {
 	}
 }
 
+// sweepExpiredLocked removes expired entries. The caller must hold r.mu.
 func (r *Resolver) sweepExpiredLocked(now time.Time) {
 	for name, entry := range r.cache {
 		if now.After(entry.expires) {
@@ -380,6 +422,8 @@ func (r *Resolver) sweepExpiredLocked(now time.Time) {
 	}
 }
 
+// newEndpoint returns a DNS endpoint that always dials the configured server
+// address, bypassing the system resolver.
 func newEndpoint(addr string) *endpoint {
 	e := &endpoint{addr: addr}
 	e.resolver = &net.Resolver{
@@ -417,6 +461,7 @@ func (e *endpoint) lookup(ctx context.Context, host string, timeout time.Duratio
 	return addrs, nil
 }
 
+// lookupFamily queries one address family (usually "ip4" or "ip6").
 func (e *endpoint) lookupFamily(ctx context.Context, host, network string) ([]net.IPAddr, error) {
 	ips, err := e.resolver.LookupIP(ctx, network, host)
 	if err != nil {
@@ -430,6 +475,8 @@ func (e *endpoint) lookupFamily(ctx context.Context, host, network string) ([]ne
 	return addrs, nil
 }
 
+// normalizeAddress validates an ip:port DNS server address and returns its
+// canonical form.
 func normalizeAddress(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -454,6 +501,8 @@ func normalizeAddress(value string) (string, error) {
 	return net.JoinHostPort(ip.String(), port), nil
 }
 
+// cloneAddrs returns a deep copy of addrs so cache users cannot mutate cached
+// address slices.
 func cloneAddrs(addrs []net.IPAddr) []net.IPAddr {
 	out := make([]net.IPAddr, len(addrs))
 	for i, addr := range addrs {
@@ -462,6 +511,7 @@ func cloneAddrs(addrs []net.IPAddr) []net.IPAddr {
 	return out
 }
 
+// formatAddrs returns a comma-separated list of IPs for debug logging.
 func formatAddrs(addrs []net.IPAddr) string {
 	values := make([]string, 0, len(addrs))
 	for _, addr := range addrs {
@@ -470,6 +520,7 @@ func formatAddrs(addrs []net.IPAddr) string {
 	return strings.Join(values, ", ")
 }
 
+// isNotFound reports whether err is a DNS name-not-found error.
 func isNotFound(err error) bool {
 	var dnsErr *net.DNSError
 	return errors.As(err, &dnsErr) && dnsErr.IsNotFound

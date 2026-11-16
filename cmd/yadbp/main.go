@@ -16,6 +16,7 @@ import (
 	"yadbp/internal/resolver"
 )
 
+// Defaults used when the corresponding command-line flags are omitted.
 const (
 	appName         = "yadbp"
 	defaultHost     = "0.0.0.0"
@@ -26,6 +27,7 @@ const (
 	defaultPrimaryDNSHealthcheck = 30
 )
 
+// config is the validated command-line configuration used to build the proxy.
 type config struct {
 	host                  string
 	port                  int
@@ -37,6 +39,8 @@ type config struct {
 	primaryDNSHealthcheck int
 }
 
+// main parses flags, loads the optional blacklist and resolver, and runs the
+// proxy until it receives SIGINT or SIGTERM.
 func main() {
 	cfg := parseFlags()
 	log := logging.New(cfg.logLevel, os.Stderr)
@@ -86,6 +90,8 @@ func main() {
 	log.Infof("Stopped.")
 }
 
+// parseFlags registers the command-line flags, validates the resulting
+// configuration, and exits with status 2 when the input is invalid.
 func parseFlags() *config {
 	cfg := &config{}
 	var logLevelName string

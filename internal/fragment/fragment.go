@@ -6,8 +6,8 @@ package fragment
 const TCPChunkSize = 40
 
 // IsClientHello reports whether record starts with a TLS handshake record that
-// carries a ClientHello. Other CONNECT payloads (SSH, plain sockets) must pass
-// through untouched.
+// carries a ClientHello. It checks only the record and handshake headers, so
+// other CONNECT payloads (SSH, plain sockets) pass through untouched.
 func IsClientHello(record []byte) bool {
 	return len(record) > 5 && record[0] == 0x16 && record[5] == 0x01
 }

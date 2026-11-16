@@ -7,10 +7,15 @@ import (
 	"strings"
 )
 
+// List is an immutable set of normalized domains. A List is safe for
+// concurrent reads after Load returns.
 type List struct {
 	domains map[string]struct{}
 }
 
+// Load reads a blacklist file and returns its domains. Blank lines and lines
+// beginning with "#" are ignored. It returns an error if the file cannot be
+// read or contains no usable domains.
 func Load(path string) (*List, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -46,6 +51,8 @@ func Load(path string) (*List, error) {
 	return list, nil
 }
 
+// IsBlocked reports whether domain or one of its parent domains is listed.
+// A nil *List matches nothing, so callers can use nil to mean "no blacklist".
 func (l *List) IsBlocked(domain string) bool {
 	if l == nil {
 		return false
@@ -69,6 +76,7 @@ func (l *List) IsBlocked(domain string) bool {
 	}
 }
 
+// Len returns the number of listed domains. A nil *List has length zero.
 func (l *List) Len() int {
 	if l == nil {
 		return 0
@@ -76,6 +84,8 @@ func (l *List) Len() int {
 	return len(l.domains)
 }
 
+// normalizeDomain lowercases and trims a host for comparison, removes a
+// trailing root dot, and drops "www." labels.
 func normalizeDomain(domain string) string {
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	domain = strings.ReplaceAll(domain, "www.", "")
